@@ -22,15 +22,12 @@ def find_dataset_dir():
         'food-ingredients-5',
         './food-ingredients-5',
         '../food-ingredients-5',
-        '/content/food-ingredients-5',
-        '/content/YOLOv11-pt/food-ingredients-5'
     ]
     
     for path in possible_paths:
         if os.path.exists(path) and os.path.exists(f'{path}/train/images'):
             return path
     
-    # If not found, return the default and let the error handling take care of it
     return 'food-ingredients-5'
 
 data_dir = find_dataset_dir()
@@ -38,7 +35,6 @@ data_dir = find_dataset_dir()
 def train(args, params):
     # Model
     model = nn.yolo_v11_n(len(params['names']))
-    # Use CPU if CUDA is not available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
 
@@ -87,8 +83,9 @@ def train(args, params):
     with open('weights/step.csv', 'w') as log:
         if args.local_rank == 0:
             logger = csv.DictWriter(log, fieldnames=['epoch',
-                                                     'box', 'cls', 'dfl',
-                                                     'Recall', 'Precision', 'mAP@50', 'mAP'])
+                                                     'train/box_loss', 'train/cls_loss', 'train/dfl_loss',
+                                                     'metrics/precision', 'metrics/recall', 'metrics/mAP@50', 'metrics/mAP',
+                                                     'val/box_loss', 'val/cls_loss', 'val/dfl_loss'])
             logger.writeheader()
 
         for epoch in range(args.epochs):
@@ -101,7 +98,7 @@ def train(args, params):
             p_bar = enumerate(loader)
 
             if args.local_rank == 0:
-                print(('\n' + '%10s' * 5) % ('epoch', 'memory', 'box', 'cls', 'dfl'))
+                print(('\n' + '%10s' * 5) % ('epoch', 'memory', 'train_box', 'train_cls', 'train_dfl'))
                 p_bar = tqdm.tqdm(p_bar, total=num_steps)
 
             optimizer.zero_grad()
@@ -124,21 +121,21 @@ def train(args, params):
                 avg_cls_loss.update(loss_cls.item(), samples.size(0))
                 avg_dfl_loss.update(loss_dfl.item(), samples.size(0))
 
-                loss_box *= args.batch_size  # loss scaled by batch_size
-                loss_cls *= args.batch_size  # loss scaled by batch_size
-                loss_dfl *= args.batch_size  # loss scaled by batch_size
-                loss_box *= args.world_size  # gradient averaged between devices in DDP mode
-                loss_cls *= args.world_size  # gradient averaged between devices in DDP mode
-                loss_dfl *= args.world_size  # gradient averaged between devices in DDP mode
+                loss_box *= args.batch_size
+                loss_cls *= args.batch_size
+                loss_dfl *= args.batch_size
+                loss_box *= args.world_size
+                loss_cls *= args.world_size
+                loss_dfl *= args.world_size
 
                 # Backward
                 amp_scale.scale(loss_box + loss_cls + loss_dfl).backward()
 
                 # Optimize
                 if step % accumulate == 0:
-                    # amp_scale.unscale_(optimizer)  # unscale gradients
-                    # util.clip_gradients(model)  # clip gradients
-                    amp_scale.step(optimizer)  # optimizer.step
+                    # amp_scale.unscale_(optimizer)
+                    # util.clip_gradients(model)
+                    amp_scale.step(optimizer)
                     amp_scale.update()
                     optimizer.zero_grad()
                     if ema:
@@ -154,17 +151,20 @@ def train(args, params):
                     p_bar.set_description(s)
 
             if args.local_rank == 0:
-                # mAP
+                # mAP and validation losses
                 last = test(args, params, ema.ema)
 
                 logger.writerow({'epoch': str(epoch + 1).zfill(3),
-                                 'box': str(f'{avg_box_loss.avg:.3f}'),
-                                 'cls': str(f'{avg_cls_loss.avg:.3f}'),
-                                 'dfl': str(f'{avg_dfl_loss.avg:.3f}'),
-                                 'mAP': str(f'{last[0]:.3f}'),
-                                 'mAP@50': str(f'{last[1]:.3f}'),
-                                 'Recall': str(f'{last[2]:.3f}'),
-                                 'Precision': str(f'{last[3]:.3f}')})
+                                 'train/box_loss': str(f'{avg_box_loss.avg:.3f}'),
+                                 'train/cls_loss': str(f'{avg_cls_loss.avg:.3f}'),
+                                 'train/dfl_loss': str(f'{avg_dfl_loss.avg:.3f}'),
+                                 'metrics/mAP': str(f'{last[0]:.3f}'),
+                                 'metrics/mAP@50': str(f'{last[1]:.3f}'),
+                                 'metrics/recall': str(f'{last[2]:.3f}'),
+                                 'metrics/precision': str(f'{last[3]:.3f}'),
+                                 'val/box_loss': str(f'{last[4]:.3f}'),
+                                 'val/cls_loss': str(f'{last[5]:.3f}'),
+                                 'val/dfl_loss': str(f'{last[6]:.3f}')})
                 log.flush()
 
                 # Update best mAP
@@ -190,7 +190,6 @@ def train(args, params):
 def test(args, params, model=None):
     filenames = glob.glob(f'{data_dir}/valid/images/*.jpg')
     
-    # Check if validation dataset exists
     if not filenames:
         print(f"Error: No validation images found in {data_dir}/valid/images/")
         print(f"Current working directory: {os.getcwd()}")
@@ -209,8 +208,12 @@ def test(args, params, model=None):
         model = torch.load(f='./weights/best.pt', map_location='cuda')
         model = model['model'].float().fuse()
 
-    model.half()
+    criterion = util.ComputeLoss(model, params)
+    
     model.eval()
+    avg_val_box_loss = util.AverageMeter()
+    avg_val_cls_loss = util.AverageMeter()
+    avg_val_dfl_loss = util.AverageMeter()
 
     # Configure
     iou_v = torch.linspace(start=0.5, end=0.95, steps=10).cuda()  # iou vector for mAP@0.5:0.95
@@ -221,14 +224,29 @@ def test(args, params, model=None):
     map50 = 0
     mean_ap = 0
     metrics = []
-    p_bar = tqdm.tqdm(loader, desc=('%10s' * 5) % ('', 'precision', 'recall', 'mAP50', 'mAP'))
+    p_bar = tqdm.tqdm(loader, desc=('%10s' * 8) % ('', 'precision', 'recall', 'mAP50', 'mAP', 'val_box', 'val_cls', 'val_dfl'))
     for samples, targets in p_bar:
         samples = samples.cuda()
-        samples = samples.half()  # uint8 to fp16/32
         samples = samples / 255.  # 0 - 255 to 0.0 - 1.0
         _, _, h, w = samples.shape  # batch-size, channels, height, width
         scale = torch.tensor((w, h, w, h)).cuda()
-        # Inference
+        
+        # Compute validation losses - need training mode for proper outputs
+        model.train()
+        with torch.amp.autocast('cuda'):
+            model_outputs = model(samples)
+            loss_box, loss_cls, loss_dfl = criterion(model_outputs, targets)
+            
+            # Update average losses
+            avg_val_box_loss.update(loss_box.item(), samples.size(0))
+            avg_val_cls_loss.update(loss_cls.item(), samples.size(0))
+            avg_val_dfl_loss.update(loss_dfl.item(), samples.size(0))
+        
+        # Switch back to eval mode for inference
+        model.eval()
+        model.half()
+        samples = samples.half()
+        
         outputs = model(samples)
         # NMS
         outputs = util.non_max_suppression(outputs)
@@ -254,15 +272,14 @@ def test(args, params, model=None):
             # Append
             metrics.append((metric, output[:, 4], output[:, 5], cls.squeeze(-1)))
 
-    # Compute metrics
     metrics = [torch.cat(x, dim=0).cpu().numpy() for x in zip(*metrics)]  # to numpy
     if len(metrics) and metrics[0].any():
         tp, fp, m_pre, m_rec, map50, mean_ap = util.compute_ap(*metrics, plot=plot, names=params["names"])
-    # Print results
-    print(('%10s' + '%10.3g' * 4) % ('', m_pre, m_rec, map50, mean_ap))
-    # Return results
-    model.float()  # for training
-    return mean_ap, map50, m_rec, m_pre
+
+    print(('%10s' + '%10.3g' * 7) % ('', m_pre, m_rec, map50, mean_ap, avg_val_box_loss.avg, avg_val_cls_loss.avg, avg_val_dfl_loss.avg))
+
+    model.float()
+    return mean_ap, map50, m_rec, m_pre, avg_val_box_loss.avg, avg_val_cls_loss.avg, avg_val_dfl_loss.avg
 
 
 def profile(args, params):
